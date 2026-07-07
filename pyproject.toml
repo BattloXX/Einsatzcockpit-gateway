@@ -1,0 +1,28 @@
+[project]
+name = "einsatzcockpit-gateway"
+version = "0.1.0"
+description = "Einsatzcockpit Print & Alarm Gateway (ECPG) – lokaler Agent für Netzwerkdruck und seriellen Alarmempfang."
+requires-python = ">=3.12"
+dependencies = [
+    "websockets>=12.0",
+    "httpx>=0.27",
+    "aiohttp>=3.9",
+    "reportlab>=4.0",
+]
+
+[project.optional-dependencies]
+# Auf dem Zielsystem (Debian-Container) verfügbar; lokal/CI optional.
+printing = ["pycups>=2.0"]
+discovery = ["zeroconf>=0.132", "pysnmp>=6.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ecpg*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,15 @@
+# ECPG Gateway – Betrieb im Feuerwehrhaus
+services:
+  ecpg-gateway:
+    image: ghcr.io/battloxx/einsatzcockpit-gateway:latest
+    network_mode: host          # nötig für mDNS/SNMP-Discovery
+    restart: unless-stopped
+    environment:
+      ECPG_CLOUD_URL: https://app.einsatzcockpit.com
+      ECPG_PAIRING_CODE: ""     # nur beim Erststart setzen (danach entfernen)
+      TZ: Europe/Vienna
+    volumes:
+      - ecpg-data:/data         # SQLite, Spool, Device-Token
+
+volumes:
+  ecpg-data:
