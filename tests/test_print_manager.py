@@ -73,3 +73,48 @@ def test_notfall_print(env):
     ok = pm.notfall_print(b"%PDF-1.4 notfall", 2)
     assert ok is True
     assert backend.printed
+
+
+class _PrintingBackend(FakeBackend):
+    """Bleibt dauerhaft 'printing' (CUPS noch nicht fertig)."""
+    def job_state(self, job_id):
+        return "printing"
+
+
+async def _install_fake_download(monkeypatch, pm):
+    async def fake_download(job):
+        path = os.path.join(pm.data_dir, "spool", f"{job['job_id']}.pdf")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"%PDF-1.4 test")
+        return path
+    monkeypatch.setattr(pm, "_download", fake_download)
+
+
+async def test_printing_job_not_resubmitted(monkeypatch, env):
+    """Regression Endlosdruck: ein noch 'printing'-Job darf über mehrere process_due-
+    Durchläufe NUR EINMAL an CUPS übergeben werden (cups_job persistiert)."""
+    pm, spool, _backend, statuses = env
+    pm.backend = _PrintingBackend()
+    pm.sync_queues({"printers": [{"id": 1, "uri": "ipp://a/ipp/print", "name": "A"}]})
+    await _install_fake_download(monkeypatch, pm)
+    pm.enqueue({"job_id": "30", "printer_id": 1, "artifact_url": "http://x/pdf"})
+    for _ in range(5):
+        await pm.process_due()
+    assert len(pm.backend.printed) == 1, "Job wurde mehrfach an CUPS gegeben (Endlosdruck!)"
+    row = spool.get_job("30")
+    assert row["status"] == "printing"
+    assert row["cups_job"] is not None
+
+
+async def test_cancel_marks_canceled_and_cancels_cups(monkeypatch, env):
+    pm, spool, _backend, statuses = env
+    pm.backend = _PrintingBackend()
+    pm.sync_queues({"printers": [{"id": 1, "uri": "ipp://a/ipp/print", "name": "A"}]})
+    await _install_fake_download(monkeypatch, pm)
+    pm.enqueue({"job_id": "40", "printer_id": 1, "artifact_url": "http://x/pdf"})
+    await pm.process_due()  # → printing, cups_job gesetzt
+    await pm.cancel("40")
+    assert spool.get_job("40")["status"] == "canceled"
+    assert ("40", "canceled", "Abgebrochen") in statuses
+    assert any(p[0] == "cancel" for p in pm.backend.printed), "CUPS-Job hätte abgebrochen werden müssen"
