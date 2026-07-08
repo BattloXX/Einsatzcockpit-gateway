@@ -1,8 +1,14 @@
 # ECPG Gateway – CUPS + Python 3.12, Multi-Arch (amd64/arm64)
 FROM python:3.12-slim
 
+# Automatische Versionierung: von der CI als build-arg injiziert (Default = dev).
+ARG ECPG_VERSION=0.0.0+dev
+LABEL org.opencontainers.image.title="einsatzcockpit-gateway" \
+      org.opencontainers.image.version="${ECPG_VERSION}"
+
 ENV PYTHONUNBUFFERED=1 \
     ECPG_DATA_DIR=/data \
+    ECPG_VERSION=${ECPG_VERSION} \
     TZ=Europe/Vienna
 
 # CUPS (driverless/IPP-Everywhere) + Discovery-Runtime
