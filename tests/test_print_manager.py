@@ -107,6 +107,47 @@ async def test_printing_job_not_resubmitted(monkeypatch, env):
     assert row["cups_job"] is not None
 
 
+async def test_html_render_job_uses_chromium_not_download(monkeypatch, env):
+    """render_kind == 'html' (Leaflet-Karte): das Gateway rendert per Chromium
+    (_render_html) statt die PDF herunterzuladen – danach normaler CUPS-Weg."""
+    pm, spool, backend, statuses = env
+    pm.sync_queues({"printers": [{"id": 1, "uri": "ipp://a/ipp/print", "name": "A"}]})
+
+    called = {"download": 0, "render": 0}
+
+    async def fake_download(job):  # darf NICHT aufgerufen werden
+        called["download"] += 1
+        raise AssertionError("HTML-Job darf nicht heruntergeladen werden")
+
+    async def fake_render(job):
+        called["render"] += 1
+        path = os.path.join(pm.data_dir, "spool", f"{job['job_id']}.pdf")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"%PDF-1.4 karte")
+        return path
+
+    monkeypatch.setattr(pm, "_download", fake_download)
+    monkeypatch.setattr(pm, "_render_html", fake_render)
+    pm.enqueue({
+        "job_id": "50", "printer_id": 1, "artifact_url": "http://x/api/v1/print/render/50?sig=t",
+        "document_type": "lage_karte", "render_kind": "html",
+    })
+    await pm.process_due()
+
+    assert called["render"] == 1 and called["download"] == 0
+    assert backend.printed, "gerenderte Karte hätte gedruckt werden müssen"
+    assert spool.get_job("50")["status"] == "done"
+
+
+async def test_html_render_kind_persisted(env):
+    """render_kind wird gespoolt (überlebt Neustart → korrekter Pfad nach Restart)."""
+    pm, spool, _backend, _statuses = env
+    pm.enqueue({"job_id": "51", "printer_id": 1, "artifact_url": "http://x/r",
+                "document_type": "site_karte", "render_kind": "html"})
+    assert spool.get_job("51")["render_kind"] == "html"
+
+
 async def test_cancel_marks_canceled_and_cancels_cups(monkeypatch, env):
     pm, spool, _backend, statuses = env
     pm.backend = _PrintingBackend()

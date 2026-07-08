@@ -154,6 +154,7 @@ class PrintManager:
             "document_type": payload.get("document_type"),
             "artifact_url": payload.get("artifact_url"),
             "options": payload.get("options") or {},
+            "render_kind": payload.get("render_kind"),
         })
 
     async def process_due(self) -> None:
@@ -202,13 +203,17 @@ class PrintManager:
             await self._fail_or_retry(job, "Drucker nicht (mehr) konfiguriert")
             return
 
-        # PDF laden (falls noch nicht gespoolt)
+        # PDF beschaffen (falls noch nicht gespoolt):
+        #  - render_kind == "html": Leaflet-Karte per Headless-Chromium rendern (JS/Tiles).
+        #  - sonst: signierte PDF-URL herunterladen (Standard).
         pdf_path = job.get("pdf_path")
         if not pdf_path or not os.path.exists(pdf_path):
+            is_html = (job.get("render_kind") == "html")
             try:
-                pdf_path = await self._download(job)
+                pdf_path = await (self._render_html(job) if is_html else self._download(job))
             except Exception as exc:
-                await self._fail_or_retry(job, f"Download fehlgeschlagen: {exc}")
+                verb = "HTML-Rendering" if is_html else "Download"
+                await self._fail_or_retry(job, f"{verb} fehlgeschlagen: {exc}")
                 return
             self.spool.update_job(job_id, pdf_path=pdf_path, status="downloading")
 
@@ -243,6 +248,16 @@ class PrintManager:
         path = os.path.join(self.data_dir, "spool", f"{job['job_id']}.pdf")
         with open(path, "wb") as fh:
             fh.write(data)
+        return path
+
+    async def _render_html(self, job: dict) -> str:
+        """Rendert eine Leaflet-Karten-Druckseite (signierte URL) per Headless-Chromium
+        zu PDF. Die Seitengröße bestimmt das @page-CSS der Druckseite."""
+        from ecpg.html_render import render_url_to_pdf
+
+        url = job["artifact_url"]
+        path = os.path.join(self.data_dir, "spool", f"{job['job_id']}.pdf")
+        await render_url_to_pdf(url, path)
         return path
 
     async def _poll_state(self, cups_job: int, tries: int = 3) -> str:

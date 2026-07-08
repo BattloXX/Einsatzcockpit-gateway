@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS spool_jobs (
     options_json  TEXT,
     pdf_path      TEXT,
     cups_job      INTEGER,
+    render_kind   TEXT,
     status        TEXT NOT NULL DEFAULT 'pending',
     attempts      INTEGER NOT NULL DEFAULT 0,
     next_retry_at REAL,
@@ -59,6 +60,11 @@ class Spool:
                 self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN cups_job INTEGER")
             except sqlite3.OperationalError:
                 pass  # Spalte existiert bereits
+            # Migration: render_kind ("html" = Leaflet-Karte, per Chromium rendern statt PDF laden).
+            try:
+                self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN render_kind TEXT")
+            except sqlite3.OperationalError:
+                pass  # Spalte existiert bereits
             self._conn.commit()
 
     # ── Key/Value ────────────────────────────────────────────────────────────
@@ -90,12 +96,14 @@ class Spool:
             self._conn.execute(
                 """INSERT OR IGNORE INTO spool_jobs
                    (job_id, printer_uri, printer_id, document_type, artifact_url,
-                    options_json, status, attempts, next_retry_at, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?, 'pending', 0, ?, ?, ?)""",
+                    options_json, render_kind, status, attempts, next_retry_at,
+                    created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?, 'pending', 0, ?, ?, ?)""",
                 (
                     str(job["job_id"]), job.get("printer_uri"), job.get("printer_id"),
                     job.get("document_type"), job.get("artifact_url"),
-                    json.dumps(job.get("options") or {}), now, now, now,
+                    json.dumps(job.get("options") or {}), job.get("render_kind"),
+                    now, now, now,
                 ),
             )
             self._conn.commit()

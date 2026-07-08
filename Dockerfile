@@ -23,6 +23,12 @@ COPY pyproject.toml ./
 COPY ecpg ./ecpg
 RUN pip install --no-cache-dir . && pip install --no-cache-dir pycups zeroconf
 
+# Headless-Chromium für Leaflet-Karten-Druck (page.pdf). `--with-deps` zieht die
+# nötigen System-Bibliotheken; das Browser-Binary landet in /root/.cache/ms-playwright.
+RUN pip install --no-cache-dir playwright \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
 VOLUME ["/data"]
 EXPOSE 8631
 
