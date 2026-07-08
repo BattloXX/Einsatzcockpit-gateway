@@ -136,6 +136,15 @@ class CloudConnector:
     async def send_printer_report(self, printers: list[dict]) -> None:
         await self._send({"type": "printer_report", "payload": {"printers": printers}})
 
+    async def send_printer_status(self, statuses: list[dict]) -> None:
+        """Erreichbarkeits-/Statusmeldung je Drucker: [{printer_id, status:{reachable,...}}]."""
+        await self._send({"type": "printer_status", "payload": {"printers": statuses}})
+
+    async def send_passthrough_status(self, *, enabled: bool, listening: bool, clients: int) -> None:
+        await self._send({"type": "passthrough_status", "payload": {
+            "enabled": enabled, "listening": listening, "clients": clients,
+        }})
+
     async def send_alarm_notice(self, raw_hash: str) -> None:
         await self._send({"type": "alarm_notice", "payload": {"raw_hash": raw_hash}})
 
