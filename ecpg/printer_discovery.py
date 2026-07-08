@@ -13,6 +13,19 @@ logger = logging.getLogger("ecpg.discovery")
 
 MDNS_TYPES = ["_ipp._tcp.local.", "_ipps._tcp.local.", "_pdl-datastream._tcp.local."]
 
+# Bonjour-TXT 'PaperMax', ab dem A3 unterstuetzt wird (Werte laut Bonjour-Printing-Spec:
+# <legal-A4, legal-A4, tabloid-A3, isoC-A2, >isoC-A2).
+_PAPER_MAX_A3 = {"tabloid-A3", "isoC-A2", ">isoC-A2"}
+
+
+def _media_from_paper_max(paper_max: str | None) -> list[str]:
+    """Unterstuetzte Papiergroessen aus dem PaperMax-Flag. A4 kann quasi jeder Drucker;
+    A3 nur, wenn PaperMax mindestens tabloid-A3 meldet."""
+    media = ["A4"]
+    if paper_max in _PAPER_MAX_A3:
+        media.append("A3")
+    return media
+
 
 async def discover(timeout: float = 4.0) -> list[dict]:
     """mDNS-Scan nach IPP-Druckern. Blockierende zeroconf-Arbeit im Thread."""
@@ -53,6 +66,9 @@ def _mdns_scan(timeout: float) -> list[dict]:
                 "capabilities": {
                     "color": props.get("Color") == "T",
                     "duplex": props.get("Duplex") == "T",
+                    # Bonjour-TXT 'PaperMax' meldet die groesste Papiergroesse. A3 wird
+                    # ab 'tabloid-A3' unterstuetzt (darunter nur bis A4/legal).
+                    "media": _media_from_paper_max(props.get("PaperMax")),
                 },
             }
 

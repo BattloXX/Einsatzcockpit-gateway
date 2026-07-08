@@ -52,6 +52,10 @@ class CupsBackend:
             cups_opts["sides"] = "two-sided-short-edge"
         else:
             cups_opts["sides"] = "one-sided"
+        # Papiergroesse (nur wenn explizit gewaehlt; Standard = Druckervorgabe/A4).
+        media = (options or {}).get("media")
+        if media in ("A3", "A4"):
+            cups_opts["media"] = media
         return self._conn.printFile(queue, path, title, cups_opts)
 
     def job_state(self, job_id: int) -> str:
