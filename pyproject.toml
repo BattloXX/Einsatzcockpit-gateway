@@ -14,6 +14,9 @@ dependencies = [
 # Auf dem Zielsystem (Debian-Container) verfügbar; lokal/CI optional.
 printing = ["pycups>=2.0"]
 discovery = ["zeroconf>=0.132", "pysnmp>=6.0"]
+# Leaflet-Karten-Druck: Headless-Chromium rendert die HTML-Druckseite (JS/Tiles).
+# Im Container installiert (siehe Dockerfile: playwright install chromium).
+render = ["playwright>=1.44"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [build-system]
