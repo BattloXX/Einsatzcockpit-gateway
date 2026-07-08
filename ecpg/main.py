@@ -22,6 +22,7 @@ from ecpg.cloud_connector import CloudConnector
 from ecpg.offline_print import render_alarm_pdf
 from ecpg.print_manager import PrintManager
 from ecpg.serial_ingest import SerialIngest
+from ecpg.serial_passthrough import SerialPassthrough
 from ecpg.settings import settings
 from ecpg.spool import Spool
 
@@ -35,7 +36,11 @@ class Agent:
         self.config: dict = self.spool.load_config()
         self.cloud: CloudConnector | None = None
         self.print_mgr: PrintManager | None = None
-        self.serial = SerialIngest(self._on_datagram, self._on_serial_status)
+        # Serial-Fan-Out: roher W&T-Strom wird 1:1 an verbundene Clients verteilt.
+        self.passthrough = SerialPassthrough()
+        self.serial = SerialIngest(
+            self._on_datagram, self._on_serial_status, on_raw=self.passthrough.broadcast,
+        )
         self._stop = asyncio.Event()
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -64,10 +69,13 @@ class Agent:
             asyncio.create_task(self._spool_loop()),
             asyncio.create_task(self._alarm_forward_loop()),
             asyncio.create_task(self._cleanup_loop()),
+            asyncio.create_task(self._printer_health_loop()),
         ]
         self.serial.start()
+        await self.passthrough.apply()
         await self._stop.wait()
         await self.serial.stop()
+        await self.passthrough.stop()
         if self.cloud:
             await self.cloud.stop()
         for t in tasks:
@@ -92,11 +100,16 @@ class Agent:
         self.config = payload
         self.spool.save_config(payload)
         self._apply_config(payload)
+        await self.passthrough.apply()
+        # Frischer Health-Check direkt nach neuer Config (z. B. Drucker aktiviert).
+        await self._report_printer_health()
 
     def _apply_config(self, config: dict) -> None:
+        wut = config.get("wut") or {}
         if self.print_mgr:
             self.print_mgr.sync_queues(config)
-        self.serial.update_config(config.get("wut") or {})
+        self.serial.update_config(wut)
+        self.passthrough.update_config(wut)
 
     # ── Druck ────────────────────────────────────────────────────────────────
     async def _on_print_job(self, payload: dict) -> None:
@@ -128,6 +141,36 @@ class Agent:
         while not self._stop.is_set():
             self.spool.cleanup_done()
             await asyncio.sleep(3600)
+
+    # ── Drucker-Verfügbarkeit ────────────────────────────────────────────────
+    async def _printer_health_loop(self) -> None:
+        """Prueft regelmaessig die Erreichbarkeit der aktiven Drucker und meldet sie
+        (+ Fan-Out-Client-Zahl) an die Cloud, damit Online/Offline korrekt angezeigt wird."""
+        while not self._stop.is_set():
+            interval = int((self.config.get("wut") or {}).get("health_interval_s") or settings.printer_health_interval_s)
+            await asyncio.sleep(max(15, interval))
+            await self._report_printer_health()
+
+    async def _report_printer_health(self) -> None:
+        if not self.cloud:
+            return
+        from ecpg import printer_health
+        printers = self.config.get("printers") or []
+        try:
+            statuses = await printer_health.probe_all(printers, timeout=settings.printer_health_timeout_s)
+            if statuses:
+                await self.cloud.send_printer_status(statuses)
+        except Exception as exc:
+            logger.warning("Drucker-Health-Check fehlgeschlagen: %s", exc)
+        # Fan-Out-Telemetrie (best effort)
+        try:
+            await self.cloud.send_passthrough_status(
+                enabled=self.passthrough._enabled,
+                listening=self.passthrough._server is not None,
+                clients=self.passthrough.client_count(),
+            )
+        except Exception:
+            pass
 
     # ── Discovery ────────────────────────────────────────────────────────────
     async def _on_discover(self, payload: dict) -> None:

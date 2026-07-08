@@ -21,6 +21,9 @@ class Settings:
     reconnect_min_s: float = 1.0
     reconnect_max_s: float = 60.0
     heartbeat_s: float = 30.0
+    # Drucker-Health-Check (Fallback, wenn nicht per config_sync gesetzt)
+    printer_health_interval_s: int = int(_env("ECPG_PRINTER_HEALTH_INTERVAL_S", "60"))
+    printer_health_timeout_s: float = float(_env("ECPG_PRINTER_HEALTH_TIMEOUT_S", "3"))
 
     @property
     def ws_url(self) -> str:

@@ -21,9 +21,14 @@ class SerialIngest:
         self,
         on_datagram: Callable[[bytes, str], Awaitable[None]],
         on_status: Callable[[bool], Awaitable[None]],
+        on_raw: Callable[[bytes], None] | None = None,
     ):
         self.on_datagram = on_datagram   # async (raw_bytes, charset)
         self.on_status = on_status       # async (connected)
+        # Optionaler Roh-Abgriff (Serial-Fan-Out): jeder vom W&T gelesene Chunk wird
+        # VOR der Datagramm-Zerlegung 1:1 weitergereicht. Synchron + fehlertolerant,
+        # damit der Alarm-Empfang nie durch einen Downstream-Fehler blockiert wird.
+        self.on_raw = on_raw
         self._task: asyncio.Task | None = None
         self._config: dict = {}
         self._connected = False
@@ -94,8 +99,10 @@ class SerialIngest:
                     chunk = await reader.readuntil(bytes([FORM_FEED]))
                 except asyncio.IncompleteReadError as exc:
                     if exc.partial:
+                        self._tap_raw(bytes(exc.partial))
                         await self._emit(bytes(exc.partial), charset)
                     return
+                self._tap_raw(bytes(chunk))
                 data = chunk.rstrip(bytes([FORM_FEED]))
                 if data.strip():
                     await self._emit(bytes(data), charset)
@@ -112,7 +119,17 @@ class SerialIngest:
                     if buffer:
                         await self._emit(bytes(buffer), charset)
                     return
+                self._tap_raw(bytes(chunk))
                 buffer.extend(chunk)
+
+    def _tap_raw(self, chunk: bytes) -> None:
+        """Roh-Chunk an den Fan-Out weitergeben (Fehler nie den Empfang stören lassen)."""
+        if self.on_raw is None or not chunk:
+            return
+        try:
+            self.on_raw(chunk)
+        except Exception:
+            logger.exception("Roh-Abgriff (Fan-Out) fehlgeschlagen – ignoriert")
 
     async def _emit(self, raw: bytes, charset: str) -> None:
         logger.info("Alarm-Datagramm empfangen (%d Bytes, %s)", len(raw), charset)
