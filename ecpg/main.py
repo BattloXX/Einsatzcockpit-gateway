@@ -120,7 +120,12 @@ class Agent:
 
     async def _on_cancel_job(self, payload: dict) -> None:
         job_id = payload.get("job_id")
-        if job_id is not None:
+        if job_id is None:
+            return
+        if self.print_mgr:
+            # Vollständiger Abbruch inkl. CUPS-Job (sonst druckt ein laufender Job weiter).
+            await self.print_mgr.cancel(job_id)
+        else:
             self.spool.update_job(str(job_id), status="canceled")
             await self._report_job_status(str(job_id), "canceled", None)
 

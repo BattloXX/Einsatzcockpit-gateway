@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS spool_jobs (
     artifact_url  TEXT,
     options_json  TEXT,
     pdf_path      TEXT,
+    cups_job      INTEGER,
     status        TEXT NOT NULL DEFAULT 'pending',
     attempts      INTEGER NOT NULL DEFAULT 0,
     next_retry_at REAL,
@@ -51,6 +52,13 @@ class Spool:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Migration für bestehende DBs: cups_job-Spalte nachrüsten (persistiert die
+            # CUPS-Job-ID, damit ein 'printing'-Job NICHT bei jedem Durchlauf erneut an
+            # CUPS übergeben wird → verhindert Endlosdruck).
+            try:
+                self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN cups_job INTEGER")
+            except sqlite3.OperationalError:
+                pass  # Spalte existiert bereits
             self._conn.commit()
 
     # ── Key/Value ────────────────────────────────────────────────────────────

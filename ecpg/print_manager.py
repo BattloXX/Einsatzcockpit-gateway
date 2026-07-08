@@ -69,6 +69,12 @@ class CupsBackend:
             return "failed"
         return "printing"
 
+    def cancel_job(self, cups_job: int) -> None:
+        try:
+            self._conn.cancelJob(cups_job)
+        except Exception:  # pragma: no cover - Job evtl. schon fertig/weg
+            pass
+
 
 class FakeBackend:
     """Backend ohne echten Druck (CI/Dev). „Druckt" sofort erfolgreich."""
@@ -91,6 +97,9 @@ class FakeBackend:
 
     def job_state(self, job_id: int) -> str:
         return "done"
+
+    def cancel_job(self, cups_job: int) -> None:
+        self.printed.append(("cancel", str(cups_job)))
 
 
 def make_backend() -> CupsBackend | FakeBackend:
@@ -151,8 +160,43 @@ class PrintManager:
         for job in self.spool.due_jobs():
             await self._process_one(job)
 
+    async def cancel(self, job_id) -> None:
+        """Bricht einen Druckauftrag ab: aus CUPS entfernen (falls schon übergeben) und
+        im Spool auf 'canceled' setzen. Meldet den Status an die Cloud zurück."""
+        job = self.spool.get_job(str(job_id))
+        if job is None:
+            return
+        if job.get("status") in ("done", "failed", "canceled"):
+            return  # bereits terminal
+        cups_job = job.get("cups_job")
+        if cups_job:
+            try:
+                await asyncio.to_thread(self.backend.cancel_job, int(cups_job))
+            except Exception as exc:  # pragma: no cover
+                logger.warning("CUPS-Abbruch für Job %s fehlgeschlagen: %s", job_id, exc)
+        self.spool.update_job(job_id, status="canceled", error="Abgebrochen")
+        await self.status_cb(job_id, "canceled", "Abgebrochen")
+        logger.info("Job %s abgebrochen", job_id)
+
     async def _process_one(self, job: dict) -> None:
         job_id = job["job_id"]
+
+        # Bereits an CUPS übergeben (cups_job gesetzt)? → NUR pollen, NICHT erneut drucken.
+        # Ohne diese Prüfung würde ein noch 'printing'-Job bei jedem process_due-Durchlauf
+        # ein weiteres Mal an CUPS gegeben → Endlosdruck (Ursache des Prod-Vorfalls).
+        cups_job = job.get("cups_job")
+        if cups_job:
+            state = await self._poll_state(int(cups_job))
+            if state == "done":
+                self.spool.update_job(job_id, status="done", error=None)
+                await self.status_cb(job_id, "done", None)
+            elif state == "failed":
+                # CUPS-Job endete abnormal → gebremster Retry (_fail_or_retry räumt cups_job
+                # weg, sodass ein Retry einen FRISCHEN CUPS-Job erzeugt, kein Endlosdruck).
+                await self._fail_or_retry(job, "CUPS meldet Abbruch")
+            # 'printing' → bleibt, nächster Durchlauf pollt denselben CUPS-Job erneut
+            return
+
         queue = self.queue_for(job.get("printer_id"))
         if queue is None:
             await self._fail_or_retry(job, "Drucker nicht (mehr) konfiguriert")
@@ -168,7 +212,7 @@ class PrintManager:
                 return
             self.spool.update_job(job_id, pdf_path=pdf_path, status="downloading")
 
-        # An CUPS übergeben
+        # Einmalig an CUPS übergeben und die CUPS-Job-ID PERSISTIEREN.
         try:
             options = _json(job.get("options_json"))
             cups_job = await asyncio.to_thread(
@@ -178,17 +222,17 @@ class PrintManager:
             await self._fail_or_retry(job, f"Druckübergabe fehlgeschlagen: {exc}")
             return
 
-        self.spool.update_job(job_id, status="printing")
+        self.spool.update_job(job_id, status="printing", cups_job=int(cups_job))
         await self.status_cb(job_id, "printing", None)
 
-        # Status pollen (kurz; CUPS verarbeitet asynchron)
+        # Status pollen (kurz; CUPS verarbeitet asynchron). Bleibt es 'printing', pollt der
+        # nächste Durchlauf über die persistierte cups_job (kein zweiter Druck).
         state = await self._poll_state(cups_job)
         if state == "done":
             self.spool.update_job(job_id, status="done", error=None)
             await self.status_cb(job_id, "done", None)
         elif state == "failed":
             await self._fail_or_retry(job, "CUPS meldet Abbruch")
-        # 'printing' → bleibt, nächster Durchlauf pollt erneut
 
     async def _download(self, job: dict) -> str:
         url = job["artifact_url"]
@@ -216,13 +260,15 @@ class PrintManager:
         job_id = job["job_id"]
         attempts = (job.get("attempts") or 0) + 1
         if attempts >= MAX_ATTEMPTS:
-            self.spool.update_job(job_id, status="failed", attempts=attempts, error=error)
+            self.spool.update_job(job_id, status="failed", attempts=attempts, error=error, cups_job=None)
             await self.status_cb(job_id, "failed", error)
             logger.warning("Job %s endgültig fehlgeschlagen: %s", job_id, error)
         else:
             delay = BACKOFF_BASE_S * (2 ** (attempts - 1))
+            # cups_job zurücksetzen: der Retry soll einen NEUEN CUPS-Job erzeugen,
+            # nicht den alten (fehlgeschlagenen) erneut pollen.
             self.spool.update_job(job_id, status="pending", attempts=attempts,
-                                  next_retry_at=time.time() + delay, error=error)
+                                  next_retry_at=time.time() + delay, error=error, cups_job=None)
             logger.info("Job %s Fehler (%s), Retry #%d in %ds", job_id, error, attempts, delay)
 
     # ── Offline-Notdruck ─────────────────────────────────────────────────────
