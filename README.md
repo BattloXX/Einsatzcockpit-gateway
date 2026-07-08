@@ -57,9 +57,24 @@ ecpg/
 
 Cloud → Gateway: `config_sync`, `print_job`, `cancel_job`, `discover_printers`,
 `probe_printer`, `test_page`, `update_available`.
-Gateway → Cloud: `hello`, `heartbeat`, `job_status`, `serial_status`,
-`printer_report`, `alarm_notice`, `log_event`. Alarme werden zusätzlich verbindlich
-per REST `POST /api/v1/gateway/alarms` (idempotent via Rohtext-Hash) ingestet.
+Gateway → Cloud: `hello` (inkl. `version`), `heartbeat`, `job_status`,
+`serial_status`, `printer_report`, `printer_status` (periodischer Erreichbarkeits-
+Check), `passthrough_status` (Serial-Fan-Out), `alarm_notice`, `log_event`. Alarme
+werden zusätzlich verbindlich per REST `POST /api/v1/gateway/alarms` (idempotent via
+Rohtext-Hash) ingestet.
+
+## Versionierung
+
+Die Version wird **automatisch** von der CI vergeben: `MAJOR.MINOR` aus `pyproject.toml`
+plus die fortlaufende Workflow-Lauf-Nummer als Patch (z. B. `0.1.42`). Bei einem
+`v*`-Git-Tag zählt stattdessen dessen Version. Der Wert wird zur Build-Zeit als
+`ECPG_VERSION` ins Image injiziert, zur Laufzeit auf der Statusseite und via `hello`
+an die Cloud gemeldet (Anzeige als Versions-Pill in der Gateway-Verwaltung) und als
+Image-Tag vergeben – neben `latest` auch `MAJOR.MINOR.N` und `sha-<kurz>`.
+
+Für einen **reproduzierbaren Betrieb** eine feste Version im `docker-compose.yml`
+pinnen statt `:latest`, z. B. `image: ghcr.io/battloxx/einsatzcockpit-gateway:0.1.42`.
+Für eine bewusste Major/Minor-Anhebung die Basis-Version in `pyproject.toml` ändern.
 
 ## Entwicklung / Tests
 
