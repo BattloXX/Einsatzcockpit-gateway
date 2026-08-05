@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from ecpg.print_manager import FakeBackend, PrintManager
+from ecpg.print_manager import FakeBackend, PrintManager, _build_cups_options
 from ecpg.spool import Spool
 
 
@@ -33,6 +33,15 @@ def test_sync_queues_creates_and_removes(env):
     assert "ecpg_1" in backend.queues
     pm.sync_queues({"printers": []})
     assert "ecpg_1" not in backend.queues
+
+
+def test_build_cups_options_forces_color_and_keeps_existing_options():
+    cups_opts = _build_cups_options({"copies": 2, "duplex": "long-edge", "media": "A3"})
+
+    assert cups_opts["print-color-mode"] == "color"
+    assert cups_opts["copies"] == "2"
+    assert cups_opts["sides"] == "two-sided-long-edge"
+    assert cups_opts["media"] == "A3"
 
 
 async def test_job_flow_prints(monkeypatch, env):

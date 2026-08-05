@@ -20,6 +20,24 @@ MAX_ATTEMPTS = 5
 BACKOFF_BASE_S = 20  # 20, 40, 80, 160, ...
 
 
+def _build_cups_options(options: dict) -> dict:
+    cups_opts = {"print-color-mode": "color"}
+    copies = int((options or {}).get("copies", 1) or 1)
+    cups_opts["copies"] = str(max(1, copies))
+    duplex = (options or {}).get("duplex", "off")
+    if duplex in ("long-edge", "long"):
+        cups_opts["sides"] = "two-sided-long-edge"
+    elif duplex in ("short-edge", "short"):
+        cups_opts["sides"] = "two-sided-short-edge"
+    else:
+        cups_opts["sides"] = "one-sided"
+    # Papiergroesse (nur wenn explizit gewaehlt; Standard = Druckervorgabe/A4).
+    media = (options or {}).get("media")
+    if media in ("A3", "A4"):
+        cups_opts["media"] = media
+    return cups_opts
+
+
 class CupsBackend:
     """Wrapper um pycups. Wird lazy importiert, damit Tests ohne CUPS laufen."""
 
@@ -42,20 +60,7 @@ class CupsBackend:
             pass
 
     def print_file(self, queue: str, path: str, title: str, options: dict) -> int:
-        cups_opts = {}
-        copies = int((options or {}).get("copies", 1) or 1)
-        cups_opts["copies"] = str(max(1, copies))
-        duplex = (options or {}).get("duplex", "off")
-        if duplex in ("long-edge", "long"):
-            cups_opts["sides"] = "two-sided-long-edge"
-        elif duplex in ("short-edge", "short"):
-            cups_opts["sides"] = "two-sided-short-edge"
-        else:
-            cups_opts["sides"] = "one-sided"
-        # Papiergroesse (nur wenn explizit gewaehlt; Standard = Druckervorgabe/A4).
-        media = (options or {}).get("media")
-        if media in ("A3", "A4"):
-            cups_opts["media"] = media
+        cups_opts = _build_cups_options(options)
         return self._conn.printFile(queue, path, title, cups_opts)
 
     def job_state(self, job_id: int) -> str:
@@ -81,7 +86,7 @@ class FakeBackend:
 
     def __init__(self) -> None:
         self.queues: dict[str, str] = {}
-        self.printed: list[tuple[str, str]] = []
+        self.printed: list[tuple] = []
         self._job = 0
 
     def ensure_queue(self, name: str, uri: str) -> None:
@@ -92,7 +97,7 @@ class FakeBackend:
 
     def print_file(self, queue: str, path: str, title: str, options: dict) -> int:
         self._job += 1
-        self.printed.append((queue, path))
+        self.printed.append((queue, path, options))
         return self._job
 
     def job_state(self, job_id: int) -> str:
