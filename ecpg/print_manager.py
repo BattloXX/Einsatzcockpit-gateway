@@ -21,7 +21,12 @@ BACKOFF_BASE_S = 20  # 20, 40, 80, 160, ...
 
 
 def _build_cups_options(options: dict) -> dict:
-    cups_opts = {"print-color-mode": "color"}
+    # "color" kommt aus der Cloud (Druckregel/Druckervorgabe, Werte "color"/"monochrome",
+    # Default "color") und entspricht 1:1 dem IPP-Keyword print-color-mode. Ohne dieses
+    # Attribut faellt CUPS auf den Treiber-/Druckervorgabewert zurueck - beim Develop
+    # ineo+ 368 fuehrte das zu S/W-Druck, obwohl die Cloud "color" sendet.
+    color = (options or {}).get("color") or "color"
+    cups_opts = {"print-color-mode": color if color in ("color", "monochrome") else "color"}
     copies = int((options or {}).get("copies", 1) or 1)
     cups_opts["copies"] = str(max(1, copies))
     duplex = (options or {}).get("duplex", "off")

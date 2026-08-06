@@ -35,13 +35,23 @@ def test_sync_queues_creates_and_removes(env):
     assert "ecpg_1" not in backend.queues
 
 
-def test_build_cups_options_forces_color_and_keeps_existing_options():
+def test_build_cups_options_defaults_to_color_and_keeps_existing_options():
     cups_opts = _build_cups_options({"copies": 2, "duplex": "long-edge", "media": "A3"})
 
     assert cups_opts["print-color-mode"] == "color"
     assert cups_opts["copies"] == "2"
     assert cups_opts["sides"] == "two-sided-long-edge"
     assert cups_opts["media"] == "A3"
+
+
+def test_build_cups_options_honors_monochrome_from_cloud():
+    cups_opts = _build_cups_options({"color": "monochrome"})
+    assert cups_opts["print-color-mode"] == "monochrome"
+
+
+def test_build_cups_options_falls_back_to_color_for_unknown_value():
+    cups_opts = _build_cups_options({"color": "quatsch"})
+    assert cups_opts["print-color-mode"] == "color"
 
 
 async def test_job_flow_prints(monkeypatch, env):
