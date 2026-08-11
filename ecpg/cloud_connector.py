@@ -119,14 +119,20 @@ class CloudConnector:
         if mid is not None:
             await self._send({"type": "ack", "id": mid})
 
-    async def _send(self, obj: dict) -> None:
+    async def _send(self, obj: dict) -> bool:
         if self._ws is None:
-            return
-        await self._ws.send(json.dumps(obj, ensure_ascii=False))
+            logger.warning("WebSocket nicht verbunden; Nachricht %s wird später nachgeholt", obj.get("type"))
+            return False
+        try:
+            await self._ws.send(json.dumps(obj, ensure_ascii=False))
+        except Exception as exc:
+            logger.warning("WebSocket-Senden für %s fehlgeschlagen: %s", obj.get("type"), exc)
+            return False
+        return True
 
     # ── Ausgehende Meldungen ─────────────────────────────────────────────────
-    async def send_job_status(self, job_id, status: str, error: str | None = None) -> None:
-        await self._send({"type": "job_status", "payload": {
+    async def send_job_status(self, job_id, status: str, error: str | None = None) -> bool:
+        return await self._send({"type": "job_status", "payload": {
             "job_id": job_id, "status": status, "error": error,
         }})
 

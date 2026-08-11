@@ -126,11 +126,12 @@ def _queue_name(printer_id: int) -> str:
 
 class PrintManager:
     def __init__(self, spool, data_dir: str, status_cb: Callable[[str, str, str | None], Awaitable[None]],
-                 backend=None):
+                 backend=None, log_cb: Callable[[str, str], Awaitable[None]] | None = None):
         self.spool = spool
         self.data_dir = data_dir
         self.status_cb = status_cb  # async (job_id, status, error)
         self.backend = backend or make_backend()
+        self.log_cb = log_cb
         self._printers: dict[int, dict] = {}  # printer_id → {name,uri,queue}
         os.makedirs(os.path.join(data_dir, "spool"), exist_ok=True)
 
@@ -201,6 +202,7 @@ class PrintManager:
             if state == "done":
                 self.spool.update_job(job_id, status="done", error=None)
                 await self.status_cb(job_id, "done", None)
+                logger.info("Job %s fertig (CUPS-Job %s)", job_id, cups_job)
             elif state == "failed":
                 # CUPS-Job endete abnormal → gebremster Retry (_fail_or_retry räumt cups_job
                 # weg, sodass ein Retry einen FRISCHEN CUPS-Job erzeugt, kein Endlosdruck).
@@ -239,6 +241,7 @@ class PrintManager:
 
         self.spool.update_job(job_id, status="printing", cups_job=int(cups_job))
         await self.status_cb(job_id, "printing", None)
+        logger.info("Job %s druckt (CUPS-Job %s, Queue %s)", job_id, cups_job, queue)
 
         # Status pollen (kurz; CUPS verarbeitet asynchron). Bleibt es 'printing', pollt der
         # nächste Durchlauf über die persistierte cups_job (kein zweiter Druck).
@@ -246,6 +249,7 @@ class PrintManager:
         if state == "done":
             self.spool.update_job(job_id, status="done", error=None)
             await self.status_cb(job_id, "done", None)
+            logger.info("Job %s fertig (CUPS-Job %s)", job_id, cups_job)
         elif state == "failed":
             await self._fail_or_retry(job, "CUPS meldet Abbruch")
 
@@ -288,6 +292,8 @@ class PrintManager:
             self.spool.update_job(job_id, status="failed", attempts=attempts, error=error, cups_job=None)
             await self.status_cb(job_id, "failed", error)
             logger.warning("Job %s endgültig fehlgeschlagen: %s", job_id, error)
+            if self.log_cb:
+                await self.log_cb("error", f"Druckauftrag {job_id} endgültig fehlgeschlagen: {error}")
         else:
             delay = BACKOFF_BASE_S * (2 ** (attempts - 1))
             # cups_job zurücksetzen: der Retry soll einen NEUEN CUPS-Job erzeugen,

@@ -50,7 +50,9 @@ class Agent:
             logger.error("Kein Device-Token – Agent kann nicht starten")
             return
 
-        self.print_mgr = PrintManager(self.spool, settings.data_dir, self._report_job_status)
+        self.print_mgr = PrintManager(
+            self.spool, settings.data_dir, self._report_job_status, log_cb=self._send_log,
+        )
         if self.config:
             self._apply_config(self.config)
 
@@ -101,6 +103,7 @@ class Agent:
         self.spool.save_config(payload)
         self._apply_config(payload)
         await self.passthrough.apply()
+        await self._resend_unreported_statuses()
         # Frischer Health-Check direkt nach neuer Config (z. B. Drucker aktiviert).
         await self._report_printer_health()
 
@@ -130,14 +133,28 @@ class Agent:
             await self._report_job_status(str(job_id), "canceled", None)
 
     async def _report_job_status(self, job_id, status: str, error: str | None) -> None:
+        if self.cloud and await self.cloud.send_job_status(job_id, status, error):
+            self.spool.mark_status_reported(job_id, status)
+
+    async def _send_log(self, level: str, message: str) -> None:
         if self.cloud:
-            await self.cloud.send_job_status(job_id, status, error)
+            await self.cloud.send_log(level, message)
+
+    async def _resend_unreported_statuses(self) -> None:
+        if not self.cloud:
+            return
+        for job in self.spool.unreported_status_jobs():
+            if await self.cloud.send_job_status(job["job_id"], job["status"], job.get("error")):
+                self.spool.mark_status_reported(job["job_id"], job["status"])
+                logger.info("Status für Job %s erfolgreich nachgeliefert: %s",
+                            job["job_id"], job["status"])
 
     async def _spool_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 if self.print_mgr:
                     await self.print_mgr.process_due()
+                await self._resend_unreported_statuses()
             except Exception as exc:
                 logger.exception("Spool-Loop-Fehler: %s", exc)
             await asyncio.sleep(10)

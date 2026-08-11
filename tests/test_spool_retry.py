@@ -4,6 +4,7 @@ import tempfile
 
 import pytest
 
+from ecpg.main import Agent
 from ecpg.spool import RING_MAX, Spool
 
 
@@ -37,6 +38,44 @@ def test_due_jobs_respects_next_retry(spool):
     assert all(j["job_id"] != "3" for j in spool.due_jobs())
     spool.update_job("3", next_retry_at=time.time() - 1)
     assert any(j["job_id"] == "3" for j in spool.due_jobs())
+
+
+def test_unreported_status_jobs_includes_terminal_jobs(spool):
+    spool.add_job({"job_id": "terminal", "artifact_url": "u", "printer_id": 5})
+    spool.update_job("terminal", status="done")
+
+    assert [j["job_id"] for j in spool.unreported_status_jobs()] == ["terminal"]
+
+    spool.mark_status_reported("terminal", "done")
+    assert spool.unreported_status_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_failed_status_send_is_replayed_later(spool):
+    class FakeCloudConnector:
+        def __init__(self):
+            self.connected = False
+            self.sent = []
+
+        async def send_job_status(self, job_id, status, error=None):
+            if not self.connected:
+                return False
+            self.sent.append((job_id, status, error))
+            return True
+
+    agent = Agent.__new__(Agent)
+    agent.spool = spool
+    agent.cloud = FakeCloudConnector()
+    spool.add_job({"job_id": "lost", "artifact_url": "u", "printer_id": 5})
+    spool.update_job("lost", status="done")
+
+    await agent._report_job_status("lost", "done", None)
+    assert [j["job_id"] for j in spool.unreported_status_jobs()] == ["lost"]
+
+    agent.cloud.connected = True
+    await agent._resend_unreported_statuses()
+    assert agent.cloud.sent == [("lost", "done", None)]
+    assert spool.unreported_status_jobs() == []
 
 
 def test_config_cache_roundtrip(spool):

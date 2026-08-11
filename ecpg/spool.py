@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS spool_jobs (
     cups_job      INTEGER,
     render_kind   TEXT,
     status        TEXT NOT NULL DEFAULT 'pending',
+    reported_status TEXT,
+    status_reported_at REAL,
     attempts      INTEGER NOT NULL DEFAULT 0,
     next_retry_at REAL,
     error         TEXT,
@@ -63,6 +65,14 @@ class Spool:
             # Migration: render_kind ("html" = Leaflet-Karte, per Chromium rendern statt PDF laden).
             try:
                 self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN render_kind TEXT")
+            except sqlite3.OperationalError:
+                pass  # Spalte existiert bereits
+            try:
+                self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN reported_status TEXT")
+            except sqlite3.OperationalError:
+                pass  # Spalte existiert bereits
+            try:
+                self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN status_reported_at REAL")
             except sqlite3.OperationalError:
                 pass  # Spalte existiert bereits
             self._conn.commit()
@@ -117,6 +127,23 @@ class Spool:
                      AND (next_retry_at IS NULL OR next_retry_at <= ?)
                    ORDER BY created_at""",
                 (now,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_status_reported(self, job_id: str, status: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE spool_jobs SET reported_status=?, status_reported_at=? WHERE job_id=?",
+                (status, time.time(), str(job_id)),
+            )
+            self._conn.commit()
+
+    def unreported_status_jobs(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM spool_jobs
+                   WHERE reported_status IS NULL OR status != reported_status
+                   ORDER BY created_at"""
             ).fetchall()
             return [dict(r) for r in rows]
 
