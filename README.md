@@ -85,3 +85,7 @@ pytest -q
 
 Die Tests laufen ohne CUPS (Fake-Backend) und ohne echten Com-Server
 (`tests/fake_comserver.py` spielt Mitschnitte ab).
+
+## Lizenz
+
+**GNU Lesser General Public License v2.1 (LGPL-2.1)** — Johannes Battlogg.
