@@ -61,7 +61,32 @@ Gateway → Cloud: `hello` (inkl. `version`), `heartbeat`, `job_status`,
 `serial_status`, `printer_report`, `printer_status` (periodischer Erreichbarkeits-
 Check), `passthrough_status` (Serial-Fan-Out), `alarm_notice`, `log_event`. Alarme
 werden zusätzlich verbindlich per REST `POST /api/v1/gateway/alarms` (idempotent via
-Rohtext-Hash) ingestet.
+Gateway-Sequenz, fuer alte Payloads via Rohtext-Hash) ingestet.
+
+## Robuster W&T-Alarmempfang
+
+Beide Strategien (`idle`, `formfeed`) puffern TCP-Stuecke und trennen mehrere
+Datagramme an Form Feed. Ohne Form Feed beendet `idle` nach `idle_ms` (Default
+2000) ein vollstaendiges Datagramm. Im Modus `formfeed` beendet eine Pause von
+`incomplete_after_ms` (Default 10000, in der W&T-Konfiguration) den Rest mit
+`incomplete=true`. Auch bei EOF oder Verbindungsabbruch wird ein gepufferter Rest
+als unvollstaendig gespeichert und versendet. Der Passthrough erhaelt weiter den
+unveraenderten Byte-Strom.
+
+Jedes Datagramm wird vor dem lokalen Parser und HTTP-Versand in SQLite gespeichert.
+Eine monotone `sequence` aus der kv-Tabelle ueberlebt Neustarts und Ring-Cleanup.
+Rohbytes (Base64), dekodierter Text, Charset, UTC-Empfangszeit, `source_addr` und
+`incomplete` werden bei jedem Retry aus demselben Datensatz gesendet. Der lokale
+Parser bleibt fuer den Offline-Notdruck erhalten; `parsed` ist fuer die Cloud
+informativ. HTTP 200 und 202 bestaetigen die Zustellung, auch bei `duplicate=true`.
+
+Der Empfang nutzt TCP-Keepalive und Reconnects mit exponentiellem Backoff von
+2 bis 60 Sekunden mit Jitter. Der Heartbeat meldet `payload.last_received_at`
+(UTC, bis zum ersten empfangenen Byte `null`). Eine Dateisperre
+`serial-ingest.lock` im Spool-Datenverzeichnis (`ECPG_DATA_DIR`) verhindert unter
+Linux einen zweiten Empfaenger im selben Verzeichnis und wird beim Stop freigegeben.
+Die Datei darf bestehen bleiben; entscheidend ist die Betriebssystem-Sperre.
+Ohne `fcntl` (Windows) entfaellt die Sperre mit einem Loghinweis.
 
 ## Versionierung
 

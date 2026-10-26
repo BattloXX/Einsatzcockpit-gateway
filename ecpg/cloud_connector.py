@@ -13,6 +13,7 @@ import json
 import logging
 import platform
 from collections import deque
+from datetime import datetime
 from typing import Awaitable, Callable
 from uuid import uuid4
 
@@ -27,7 +28,9 @@ Handler = Callable[[dict], Awaitable[None]]
 
 
 class CloudConnector:
-    def __init__(self, device_token: str, handlers: dict[str, Handler]):
+    def __init__(self, device_token: str, handlers: dict[str, Handler], *,
+                 serial_last_received_at: Callable[[], datetime | None] | None = None):
+        self.serial_last_received_at = serial_last_received_at
         self.device_token = device_token
         self.handlers = handlers  # type → async handler(payload)
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -91,7 +94,10 @@ class CloudConnector:
         while True:
             await asyncio.sleep(settings.heartbeat_s)
             try:
-                await self._send({"type": "heartbeat"})
+                last_received = self.serial_last_received_at() if self.serial_last_received_at else None
+                await self._send({"type": "heartbeat", "payload": {
+                    "last_received_at": last_received.isoformat() if last_received else None,
+                }})
             except Exception:
                 return
 
