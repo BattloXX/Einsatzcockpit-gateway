@@ -14,6 +14,7 @@ import logging
 import platform
 from collections import deque
 from typing import Awaitable, Callable
+from uuid import uuid4
 
 import websockets
 
@@ -33,6 +34,8 @@ class CloudConnector:
         self._seen_ids: deque[str] = deque(maxlen=512)
         self._stop = asyncio.Event()
         self._connected = asyncio.Event()
+        self.status_ack_supported = True
+        self._intent_waiters = {}
 
     @property
     def connected(self) -> bool:
@@ -64,10 +67,11 @@ class CloudConnector:
             ping_interval=None, max_size=8 * 1024 * 1024,
         ) as ws:
             self._ws = ws
+            self.status_ack_supported = True  # bis config_sync keine blosse Transportbestaetigung
             self._connected.set()
             logger.info("Mit Cloud verbunden: %s", settings.ws_url)
             await self._send({"type": "hello", "payload": {
-                "version": __version__,
+                "version": __version__, "capabilities": ["print-status-v2"],
                 "host_info": {"platform": platform.platform(), "python": platform.python_version()},
             }})
             hb = asyncio.create_task(self._heartbeat_loop())
@@ -77,6 +81,11 @@ class CloudConnector:
             finally:
                 hb.cancel()
                 self._ws = None
+                self._connected.clear()
+                for waiter in self._intent_waiters.values():
+                    if not waiter.done():
+                        waiter.set_result(None)
+                self._intent_waiters.clear()
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -92,6 +101,14 @@ class CloudConnector:
         except json.JSONDecodeError:
             return
         mtype = msg.get("type")
+        if mtype == "intent_result":
+            waiter = self._intent_waiters.get(msg.get("rid"))
+            if waiter is not None and not waiter.done():
+                ok = (msg.get("payload") or {}).get("ok")
+                waiter.set_result(ok if isinstance(ok, bool) else None)
+            return
+        if mtype == "config_sync":
+            self.status_ack_supported = "print-status-ack-v1" in (msg.get("capabilities") or [])
         mid = msg.get("id")
 
         if mtype == "pong":
@@ -131,10 +148,27 @@ class CloudConnector:
         return True
 
     # ── Ausgehende Meldungen ─────────────────────────────────────────────────
-    async def send_job_status(self, job_id, status: str, error: str | None = None) -> bool:
-        return await self._send({"type": "job_status", "payload": {
-            "job_id": job_id, "status": status, "error": error,
+    async def request_print_intent(self, job) -> bool | None:
+        """True: freigegeben, False: explizit verweigert, None: nicht erhalten."""
+        rid = uuid4().hex
+        waiter = asyncio.get_running_loop().create_future()
+        self._intent_waiters[rid] = waiter
+        try:
+            sent = await self._send({"type": "print_intent", "rid": rid, "payload": {
+                "job_id": int(job["job_id"]), "dispatch_token": job["dispatch_token"], "generation": job["generation"]}})
+            if not sent:
+                return None
+            return await asyncio.wait_for(waiter, timeout=10)
+        except Exception:
+            return None
+        finally:
+            self._intent_waiters.pop(rid, None)
+
+    async def send_job_status(self, job_id, status: str, error: str | None = None, *, not_submitted=False) -> bool:
+        sent = await self._send({"type": "job_status", "payload": {
+            "job_id": job_id, "status": status, "error": error, "not_submitted": not_submitted,
         }})
+        return sent and not self.status_ack_supported
 
     async def send_serial_status(self, connected: bool) -> None:
         await self._send({"type": "serial_status", "payload": {"connected": connected}})

@@ -75,7 +75,27 @@ class Spool:
                 self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN status_reported_at REAL")
             except sqlite3.OperationalError:
                 pass  # Spalte existiert bereits
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(spool_jobs)")}
+            if "submitted_at" not in columns:
+                self._conn.execute("ALTER TABLE spool_jobs ADD COLUMN submitted_at REAL")
+            for name, kind in (("requires_intent", "INTEGER DEFAULT 0"), ("dispatch_token", "TEXT"), ("generation", "INTEGER")):
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE spool_jobs ADD COLUMN {name} {kind}")
+            for name, kind in (("status_failures", "INTEGER DEFAULT 0"), ("status_unknown_since", "REAL")):
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE spool_jobs ADD COLUMN {name} {kind}")
+            # Legacy 'printing' ohne CUPS-ID und neue abgebrochene Intents sind unklar.
+            self._conn.execute("UPDATE spool_jobs SET status='uncertain', error='restart_during_cups_submit' "
+                "WHERE cups_job IS NULL AND (status='submitting' OR status='printing')")
             self._conn.commit()
+
+    def begin_submit(self, job_id: str) -> bool:
+        with self._lock:
+            changed = self._conn.execute("UPDATE spool_jobs SET status='submitting', submitted_at=?, updated_at=? "
+                "WHERE job_id=? AND submitted_at IS NULL AND status IN ('pending','downloading')",
+                (time.time(), time.time(), str(job_id))).rowcount
+            self._conn.commit()
+            return changed == 1
 
     # ── Key/Value ────────────────────────────────────────────────────────────
     def get(self, key: str) -> str | None:
@@ -116,6 +136,17 @@ class Spool:
                     now, now, now,
                 ),
             )
+            self._conn.execute("UPDATE spool_jobs SET requires_intent=?,dispatch_token=?,generation=? "
+                "WHERE job_id=? AND submitted_at IS NULL AND status IN ('pending','downloading') "
+                "AND (generation IS NULL OR generation < ?)",
+                (int(bool(job.get("requires_intent"))), job.get("dispatch_token"), job.get("generation"),
+                 str(job["job_id"]), job.get("generation")))
+            self._conn.commit()
+
+    def refresh_artifact(self, job_id, url):
+        with self._lock:
+            self._conn.execute("UPDATE spool_jobs SET artifact_url=? WHERE job_id=? AND submitted_at IS NULL "
+                "AND status IN ('pending','downloading')", (url, str(job_id)))
             self._conn.commit()
 
     def due_jobs(self, now: float | None = None) -> list[dict]:
@@ -133,8 +164,8 @@ class Spool:
     def mark_status_reported(self, job_id: str, status: str) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE spool_jobs SET reported_status=?, status_reported_at=? WHERE job_id=?",
-                (status, time.time(), str(job_id)),
+                "UPDATE spool_jobs SET reported_status=?, status_reported_at=? WHERE job_id=? AND status=?",
+                (status, time.time(), str(job_id), status),
             )
             self._conn.commit()
 
@@ -147,17 +178,37 @@ class Spool:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def update_job(self, job_id: str, **fields: Any) -> None:
+    def update_job(self, job_id: str, *, allowed_states=None, **fields: Any) -> bool:
         if not fields:
-            return
+            return False
         fields["updated_at"] = time.time()
         cols = ", ".join(f"{k}=?" for k in fields)
+        where, params = "job_id=?", [*fields.values(), str(job_id)]
+        if allowed_states is not None:
+            where += " AND status IN (" + ",".join("?" for _ in allowed_states) + ")"
+            params.extend(allowed_states)
+        if "status" in fields:
+            # Ein verspaeteter Download/Retry/Poll darf einen terminalen Zustand
+            # weder reaktivieren noch in einen anderen Endstatus umschreiben.
+            where += " AND (status NOT IN ('done','failed','canceled','uncertain') OR status=?)"
+            params.append(fields["status"])
+            if fields["status"] in ("pending", "downloading"):
+                where += " AND submitted_at IS NULL"
         with self._lock:
-            self._conn.execute(
-                f"UPDATE spool_jobs SET {cols} WHERE job_id=?",
-                (*fields.values(), str(job_id)),
-            )
+            changed = self._conn.execute(f"UPDATE spool_jobs SET {cols} WHERE {where}", params).rowcount
             self._conn.commit()
+            return changed == 1
+
+    def cancel_job(self, job_id: str) -> dict | None:
+        with self._lock:
+            changed = self._conn.execute(
+                "UPDATE spool_jobs SET status=CASE WHEN submitted_at IS NOT NULL OR cups_job IS NOT NULL "
+                "THEN 'uncertain' ELSE 'canceled' END, error=?, updated_at=? "
+                "WHERE job_id=? AND status NOT IN ('done','failed','canceled','uncertain')",
+                ("Abbruch angefordert; Ausgabe pruefen", time.time(), str(job_id)),
+            ).rowcount
+            self._conn.commit()
+            return self.get_job(job_id) if changed else None
 
     def get_job(self, job_id: str) -> dict | None:
         with self._lock:
@@ -178,7 +229,8 @@ class Spool:
         cutoff = time.time() - older_than_s
         with self._lock:
             self._conn.execute(
-                "DELETE FROM spool_jobs WHERE status IN ('done','failed','canceled') AND updated_at < ?",
+                "UPDATE spool_jobs SET artifact_url=NULL,pdf_path=NULL,options_json='{}' "
+                "WHERE status IN ('done','failed','canceled','uncertain') AND updated_at < ?",
                 (cutoff,),
             )
             self._conn.commit()

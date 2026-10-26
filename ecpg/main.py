@@ -52,6 +52,7 @@ class Agent:
 
         self.print_mgr = PrintManager(
             self.spool, settings.data_dir, self._report_job_status, log_cb=self._send_log,
+            intent_cb=self._print_intent, refresh_cb=self._refresh_artifact,
         )
         if self.config:
             self._apply_config(self.config)
@@ -59,6 +60,8 @@ class Agent:
         self.cloud = CloudConnector(token, {
             "config_sync": self._on_config_sync,
             "print_job": self._on_print_job,
+            "job_status_ack": self._on_job_status_ack,
+            "print_job_refresh": self._on_print_job_refresh,
             "cancel_job": self._on_cancel_job,
             "discover_printers": self._on_discover,
             "probe_printer": self._on_probe,
@@ -119,7 +122,27 @@ class Agent:
         if not self.print_mgr:
             return
         self.print_mgr.enqueue(payload)
-        await self.print_mgr.process_due()
+        # Der WS-Reader muss intent_result und Status-ACKs waehrend des Drucks lesen koennen.
+        async def process():
+            try:
+                await self.print_mgr.process_due()
+            except Exception:
+                logger.exception("Druck-Task fehlgeschlagen; persistenter Spool bleibt erhalten")
+        if not hasattr(self, "_print_tasks"):
+            self._print_tasks = set()
+        task = asyncio.create_task(process())
+        self._print_tasks.add(task)
+        task.add_done_callback(self._print_tasks.discard)
+
+    async def _print_intent(self, job):
+        return await self.cloud.request_print_intent(job) if self.cloud else None
+
+    async def _refresh_artifact(self, job_id):
+        if self.cloud:
+            await self.cloud._send({"type": "refresh_artifact", "payload": {"job_id": int(job_id)}})
+
+    async def _on_print_job_refresh(self, payload):
+        self.spool.refresh_artifact(str(payload.get("job_id")), payload.get("artifact_url"))
 
     async def _on_cancel_job(self, payload: dict) -> None:
         job_id = payload.get("job_id")
@@ -132,8 +155,13 @@ class Agent:
             self.spool.update_job(str(job_id), status="canceled")
             await self._report_job_status(str(job_id), "canceled", None)
 
+    async def _on_job_status_ack(self, payload: dict) -> None:
+        self.spool.mark_status_reported(str(payload.get("job_id")), str(payload.get("status")))
+
     async def _report_job_status(self, job_id, status: str, error: str | None) -> None:
-        if self.cloud and await self.cloud.send_job_status(job_id, status, error):
+        job = self.spool.get_job(str(job_id)) or {}
+        safe = job.get("submitted_at") is None and not job.get("cups_job")
+        if self.cloud and await self.cloud.send_job_status(job_id, status, error, not_submitted=safe):
             self.spool.mark_status_reported(job_id, status)
 
     async def _send_log(self, level: str, message: str) -> None:
@@ -144,10 +172,11 @@ class Agent:
         if not self.cloud:
             return
         for job in self.spool.unreported_status_jobs():
-            if await self.cloud.send_job_status(job["job_id"], job["status"], job.get("error")):
-                self.spool.mark_status_reported(job["job_id"], job["status"])
-                logger.info("Status für Job %s erfolgreich nachgeliefert: %s",
-                            job["job_id"], job["status"])
+            if job["status"] in ("pending", "downloading", "submitting"):
+                continue
+            if job["status"] == "printing" and job.get("status_failures"):
+                continue  # Kein erneuter Fortschrittsnachweis waehrend CUPS unklar ist.
+            await self._report_job_status(job["job_id"], job["status"], job.get("error"))
 
     async def _spool_loop(self) -> None:
         while not self._stop.is_set():

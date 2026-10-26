@@ -175,6 +175,6 @@ async def test_cancel_marks_canceled_and_cancels_cups(monkeypatch, env):
     pm.enqueue({"job_id": "40", "printer_id": 1, "artifact_url": "http://x/pdf"})
     await pm.process_due()  # → printing, cups_job gesetzt
     await pm.cancel("40")
-    assert spool.get_job("40")["status"] == "canceled"
-    assert ("40", "canceled", "Abgebrochen") in statuses
+    assert spool.get_job("40")["status"] == "uncertain"
+    assert ("40", "uncertain", "Abbruch angefordert; Ausgabe pruefen") in statuses
     assert any(p[0] == "cancel" for p in pm.backend.printed), "CUPS-Job hätte abgebrochen werden müssen"
