@@ -116,8 +116,22 @@ def make_backend() -> CupsBackend | FakeBackend:
     try:
         return CupsBackend()
     except Exception as exc:  # pragma: no cover - abhängig von CUPS
-        logger.warning("CUPS nicht verfügbar (%s) – Fake-Backend aktiv", exc)
-        return FakeBackend()
+        logger.warning("CUPS nicht verfügbar (%s) – Druck bleibt ausstehend", exc)
+        return UnavailableBackend()
+
+
+class UnavailableBackend:
+    available = False
+    def ensure_queue(self, *args):
+        raise RuntimeError("CUPS nicht erreichbar")
+    def remove_queue(self, *args):
+        pass
+    def print_file(self, *args):
+        raise RuntimeError("CUPS nicht erreichbar")
+    def cancel_job(self, *args):
+        pass
+    def job_state(self, *args):
+        raise RuntimeError("CUPS nicht erreichbar")
 
 
 def _queue_name(printer_id: int) -> str:
@@ -126,11 +140,13 @@ def _queue_name(printer_id: int) -> str:
 
 class PrintManager:
     def __init__(self, spool, data_dir: str, status_cb: Callable[[str, str, str | None], Awaitable[None]],
-                 backend=None, log_cb: Callable[[str, str], Awaitable[None]] | None = None):
+                 backend=None, log_cb: Callable[[str, str], Awaitable[None]] | None = None, intent_cb=None, refresh_cb=None):
         self.spool = spool
+        self._process_lock = asyncio.Lock()
         self.data_dir = data_dir
         self.status_cb = status_cb  # async (job_id, status, error)
         self.backend = backend or make_backend()
+        self.intent_cb, self.refresh_cb = intent_cb, refresh_cb
         self.log_cb = log_cb
         self._printers: dict[int, dict] = {}  # printer_id → {name,uri,queue}
         os.makedirs(os.path.join(data_dir, "spool"), exist_ok=True)
@@ -166,11 +182,14 @@ class PrintManager:
             "artifact_url": payload.get("artifact_url"),
             "options": payload.get("options") or {},
             "render_kind": payload.get("render_kind"),
+            "requires_intent": payload.get("requires_intent", False),
+            "dispatch_token": payload.get("dispatch_token"), "generation": payload.get("generation"),
         })
 
     async def process_due(self) -> None:
-        for job in self.spool.due_jobs():
-            await self._process_one(job)
+        async with self._process_lock:
+            for job in self.spool.due_jobs():
+                await self._process_one(job)
 
     async def cancel(self, job_id) -> None:
         """Bricht einen Druckauftrag ab: aus CUPS entfernen (falls schon übergeben) und
@@ -178,7 +197,7 @@ class PrintManager:
         job = self.spool.get_job(str(job_id))
         if job is None:
             return
-        if job.get("status") in ("done", "failed", "canceled"):
+        if job.get("status") in ("done", "failed", "canceled", "uncertain"):
             return  # bereits terminal
         cups_job = job.get("cups_job")
         if cups_job:
@@ -186,8 +205,9 @@ class PrintManager:
                 await asyncio.to_thread(self.backend.cancel_job, int(cups_job))
             except Exception as exc:  # pragma: no cover
                 logger.warning("CUPS-Abbruch für Job %s fehlgeschlagen: %s", job_id, exc)
-        self.spool.update_job(job_id, status="canceled", error="Abgebrochen")
-        await self.status_cb(job_id, "canceled", "Abgebrochen")
+        state = "uncertain" if job.get("submitted_at") is not None or cups_job else "canceled"
+        self.spool.update_job(job_id, status=state, error="Abbruch angefordert; Ausgabe pruefen")
+        await self.status_cb(job_id, state, "Abbruch angefordert; Ausgabe pruefen")
         logger.info("Job %s abgebrochen", job_id)
 
     async def _process_one(self, job: dict) -> None:
@@ -206,8 +226,9 @@ class PrintManager:
             elif state == "failed":
                 # CUPS-Job endete abnormal → gebremster Retry (_fail_or_retry räumt cups_job
                 # weg, sodass ein Retry einen FRISCHEN CUPS-Job erzeugt, kein Endlosdruck).
-                await self._fail_or_retry(job, "CUPS meldet Abbruch")
-            # 'printing' → bleibt, nächster Durchlauf pollt denselben CUPS-Job erneut
+                await self._uncertain(job_id, "CUPS meldet Abbruch nach moeglicher Seitenausgabe")
+            else:
+                await self.status_cb(job_id, "printing", None)
             return
 
         queue = self.queue_for(job.get("printer_id"))
@@ -225,20 +246,41 @@ class PrintManager:
                 pdf_path = await (self._render_html(job) if is_html else self._download(job))
             except Exception as exc:
                 verb = "HTML-Rendering" if is_html else "Download"
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 403 and self.refresh_cb:
+                    await self.refresh_cb(job_id)
                 await self._fail_or_retry(job, f"{verb} fehlgeschlagen: {exc}")
                 return
             self.spool.update_job(job_id, pdf_path=pdf_path, status="downloading")
 
-        # Einmalig an CUPS übergeben und die CUPS-Job-ID PERSISTIEREN.
+        # Der Intent liegt vor der unklaren CUPS-Grenze dauerhaft in SQLite.
+        if not getattr(self.backend, "available", True):
+            await self._fail_or_retry(job, "CUPS nicht erreichbar")
+            return
+        if job.get("requires_intent"):
+            try:
+                granted = bool(self.intent_cb and await self.intent_cb(job))
+            except Exception:
+                granted = False
+            if not granted:
+                await self._uncertain(job_id, "Keine gueltige Cloud-Druckfreigabe; kein lokaler Druck gestartet")
+                return
+        if not self.spool.begin_submit(job_id):
+            return
         try:
             options = _json(job.get("options_json"))
             cups_job = await asyncio.to_thread(
                 self.backend.print_file, queue, pdf_path, f"ECPG {job_id}", options
             )
         except Exception as exc:
-            await self._fail_or_retry(job, f"Druckübergabe fehlgeschlagen: {exc}")
+            await self._uncertain(job_id, f"Druckuebergabe unklar: {type(exc).__name__}")
             return
 
+        current = self.spool.get_job(job_id)
+        if current is not None and current["status"] in ("canceled", "uncertain"):
+            self.spool.update_job(job_id, cups_job=int(cups_job))
+            await asyncio.to_thread(self.backend.cancel_job, int(cups_job))
+            await self.status_cb(job_id, current["status"], current.get("error"))
+            return
         self.spool.update_job(job_id, status="printing", cups_job=int(cups_job))
         await self.status_cb(job_id, "printing", None)
         logger.info("Job %s druckt (CUPS-Job %s, Queue %s)", job_id, cups_job, queue)
@@ -251,7 +293,7 @@ class PrintManager:
             await self.status_cb(job_id, "done", None)
             logger.info("Job %s fertig (CUPS-Job %s)", job_id, cups_job)
         elif state == "failed":
-            await self._fail_or_retry(job, "CUPS meldet Abbruch")
+            await self._uncertain(job_id, "CUPS meldet Abbruch nach moeglicher Seitenausgabe")
 
     async def _download(self, job: dict) -> str:
         url = job["artifact_url"]
@@ -284,6 +326,10 @@ class PrintManager:
                 return state
             await asyncio.sleep(1.0)
         return "printing"
+
+    async def _uncertain(self, job_id: str, error: str) -> None:
+        self.spool.update_job(job_id, status="uncertain", error=error)
+        await self.status_cb(job_id, "uncertain", error)
 
     async def _fail_or_retry(self, job: dict, error: str) -> None:
         job_id = job["job_id"]
