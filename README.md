@@ -65,16 +65,18 @@ Rohtext-Hash) ingestet.
 
 ## Versionierung
 
-Die Version wird **automatisch** von der CI vergeben: `MAJOR.MINOR` aus `pyproject.toml`
-plus die fortlaufende Workflow-Lauf-Nummer als Patch (z. B. `0.1.42`). Bei einem
-`v*`-Git-Tag zählt stattdessen dessen Version. Der Wert wird zur Build-Zeit als
-`ECPG_VERSION` ins Image injiziert, zur Laufzeit auf der Statusseite und via `hello`
-an die Cloud gemeldet (Anzeige als Versions-Pill in der Gateway-Verwaltung) und als
-Image-Tag vergeben – neben `latest` auch `MAJOR.MINOR.N` und `sha-<kurz>`.
+Die Version folgt **CalVer** wie Einsatzcockpit und der Windows-Druckagent: Ein
+Release-Tag `vJJJJ.MM.TT` (bei mehreren Releases am Tag `vJJJJ.MM.TT.N`) ergibt die
+Version `JJJJ.MM.TT`; Builds von `main` ohne Tag erhalten `JJJJ.MM.TT.<Laufnummer>`.
+Der Wert wird zur Build-Zeit als `ECPG_VERSION` ins Image injiziert, zur Laufzeit auf
+der Statusseite und via `hello` an die Cloud gemeldet (Anzeige als Versions-Pill in der
+Gateway-Verwaltung) und als Image-Tag vergeben – neben `latest` auch die Version und
+`sha-<kurz>`. Die `version` in `pyproject.toml` nennt nur den letzten Release-Stand
+für lokale Installationen.
 
 Für einen **reproduzierbaren Betrieb** eine feste Version im `docker-compose.yml`
-pinnen statt `:latest`, z. B. `image: ghcr.io/battloxx/einsatzcockpit-gateway:0.1.42`.
-Für eine bewusste Major/Minor-Anhebung die Basis-Version in `pyproject.toml` ändern.
+pinnen statt `:latest`, z. B. `image: ghcr.io/battloxx/einsatzcockpit-gateway:2026.10.26`.
+Ein Release entsteht mit `gh release create vJJJJ.MM.TT --target main`.
 
 ## Entwicklung / Tests
 

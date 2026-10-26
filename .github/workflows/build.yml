@@ -28,16 +28,15 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      # Automatische Versionierung: MAJOR.MINOR aus pyproject.toml + fortlaufende
-      # CI-Lauf-Nummer als Patch (z. B. 0.1.42). Bei einem v*-Tag zählt dessen Version.
+      # CalVer wie Einsatzcockpit: Release-Tag vJJJJ.MM.TT -> JJJJ.MM.TT,
+      # sonst Datum des Builds + Laufnummer (JJJJ.MM.TT.N).
       - name: Version bestimmen
         id: ver
         run: |
-          BASE=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([0-9]+\.[0-9]+).*/\1/')
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
           else
-            VERSION="${BASE}.${GITHUB_RUN_NUMBER}"
+            VERSION="$(date -u +%Y.%m.%d).${GITHUB_RUN_NUMBER}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ECPG-Version: $VERSION"

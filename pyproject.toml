@@ -1,6 +1,6 @@
 [project]
 name = "einsatzcockpit-gateway"
-version = "0.1.0"
+version = "2026.10.26"
 description = "Einsatzcockpit Print & Alarm Gateway (ECPG) – lokaler Agent für Netzwerkdruck und seriellen Alarmempfang."
 requires-python = ">=3.12"
 dependencies = [
