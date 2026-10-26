@@ -3,8 +3,8 @@ from ecpg import _resolve_version
 
 
 def test_env_version_wins(monkeypatch):
-    monkeypatch.setenv("ECPG_VERSION", "0.1.42")
-    assert _resolve_version() == "0.1.42"
+    monkeypatch.setenv("ECPG_VERSION", "2026.10.26.42")
+    assert _resolve_version() == "2026.10.26.42"
 
 
 def test_env_version_stripped(monkeypatch):
