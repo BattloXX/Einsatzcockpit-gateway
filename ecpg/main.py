@@ -9,10 +9,11 @@ Ablauf:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
 import signal
-from datetime import datetime
+from datetime import UTC, datetime
 
 import httpx
 
@@ -40,6 +41,7 @@ class Agent:
         self.passthrough = SerialPassthrough()
         self.serial = SerialIngest(
             self._on_datagram, self._on_serial_status, on_raw=self.passthrough.broadcast,
+            data_dir=self.spool.data_dir,
         )
         self._stop = asyncio.Event()
 
@@ -67,7 +69,7 @@ class Agent:
             "probe_printer": self._on_probe,
             "test_page": self._on_test_page,
             "update_available": self._on_update_available,
-        })
+        }, serial_last_received_at=lambda: self.serial.last_received_at)
 
         tasks = [
             asyncio.create_task(self.cloud.run()),
@@ -250,10 +252,13 @@ class Agent:
         if self.cloud:
             await self.cloud.send_serial_status(connected)
 
-    async def _on_datagram(self, raw: bytes, charset: str) -> None:
+    async def _on_datagram(self, raw: bytes, charset: str, incomplete: bool = False) -> None:
         text = raw.decode(charset, errors="replace")
         raw_hash = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-        alarm_id = self.spool.add_raw_alarm(raw, charset, raw_hash)
+        alarm_id = self.spool.add_raw_alarm(
+            raw, charset, raw_hash, incomplete=incomplete, source_addr=self.serial.source_addr,
+        )
+        alarm = self.spool.get_raw_alarm(alarm_id)
 
         parser = get_parser(self.config.get("parser"))
         parsed = None
@@ -263,7 +268,7 @@ class Agent:
             logger.warning("Parser-Fehler: %s", exc)
         parse_status = "parsed" if parsed else "parse_failed"
 
-        forwarded = await self._forward_alarm(text, charset, parsed, parse_status)
+        forwarded = await self._forward_alarm(alarm, parsed, parse_status)
         if forwarded:
             self.spool.mark_alarm_forwarded(alarm_id)
             if self.cloud:
@@ -272,7 +277,7 @@ class Agent:
             # Cloud nicht erreichbar → Offline-Notdruck
             self._offline_notdruck(text)
 
-    async def _forward_alarm(self, text: str, charset: str, parsed, parse_status: str) -> bool:
+    async def _forward_alarm(self, alarm: dict, parsed, parse_status: str) -> bool:
         token = pairing.get_device_token(self.spool)
         if not token:
             return False
@@ -281,10 +286,14 @@ class Agent:
                 resp = await client.post(
                     settings.alarms_url,
                     headers={"Authorization": f"Bearer {token}"},
-                    json={"raw_text": text, "charset": charset,
+                    json={"raw_text": bytes(alarm["raw_bytes"]).decode(alarm["charset"] or "cp850", errors="replace"),
+                          "raw_bytes_b64": base64.b64encode(alarm["raw_bytes"]).decode("ascii"),
+                          "charset": alarm["charset"], "sequence": alarm["sequence"],
+                          "received_at": datetime.fromtimestamp(alarm["received_at"], UTC).isoformat(),
+                          "source_addr": alarm["source_addr"], "incomplete": bool(alarm["incomplete"]),
                           "parsed": parsed, "parse_status": parse_status},
                 )
-            return resp.status_code == 200
+            return resp.status_code in (200, 202)
         except httpx.HTTPError as exc:
             logger.warning("Alarm-Weiterleitung fehlgeschlagen: %s", exc)
             return False
@@ -307,9 +316,9 @@ class Agent:
                 parsed = None
                 try:
                     parsed = parser.parse(text)
-                except Exception:
-                    pass
-                ok = await self._forward_alarm(text, row["charset"], parsed,
+                except Exception as exc:
+                    logger.warning("Parser-Fehler beim Nachsenden: %s", exc)
+                ok = await self._forward_alarm(row, parsed,
                                                "parsed" if parsed else "parse_failed")
                 if ok:
                     self.spool.mark_alarm_forwarded(row["id"])

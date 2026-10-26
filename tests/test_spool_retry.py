@@ -230,3 +230,190 @@ async def test_status_needs_cloud_ack_until_legacy_protocol_negotiated():
     assert not await connector.send_job_status("1", "done")
     await connector._on_message(json.dumps({"type": "config_sync", "payload": {}}))
     assert await connector.send_job_status("1", "done")
+
+
+def test_alarm_sequence_survives_restart_and_ring_cleanup(tmp_path):
+    path = str(tmp_path / "alarms.db")
+    first = Spool(path)
+    alarm_id = first.add_raw_alarm(b"first", "cp850", "h", incomplete=True, source_addr="com:8000")
+    row = first.get_raw_alarm(alarm_id)
+    assert row["sequence"] == 1 and row["incomplete"] == 1 and row["source_addr"] == "com:8000"
+    first._conn.execute("DELETE FROM raw_alarms_ring")
+    first._conn.commit()
+    first.close()
+    second = Spool(path)
+    alarm_id = second.add_raw_alarm(b"second", "cp850", "h")
+    assert second.get_raw_alarm(alarm_id)["sequence"] == 2
+    second.close()
+
+
+def test_old_alarm_schema_migration_is_idempotent(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "legacy.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE raw_alarms_ring (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                     "received_at REAL, raw_bytes BLOB, charset TEXT, raw_hash TEXT, forwarded INTEGER DEFAULT 0)")
+        conn.execute("INSERT INTO raw_alarms_ring (received_at,raw_bytes,charset,raw_hash) VALUES (1,?,'cp850','h')", (b"old",))
+    for _ in range(2):
+        spool = Spool(path)
+        assert spool.pending_alarms()[0]["sequence"] == 1
+        assert spool.pending_alarms()[0]["incomplete"] == 0
+        spool.close()
+    spool = Spool(path)
+    alarm_id = spool.add_raw_alarm(b"new", "cp850", "h")
+    assert spool.get_raw_alarm(alarm_id)["sequence"] == 2
+    spool.close()
+
+
+@pytest.mark.parametrize("status_code", [200, 202, 500])
+async def test_alarm_payload_and_retry_preserve_metadata(spool, monkeypatch, status_code):
+    import asyncio
+    import base64
+    import json
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    import httpx
+
+    from ecpg import main
+
+    agent = Agent.__new__(Agent)
+    agent.spool = spool
+    agent.config = {}
+    agent.cloud = None
+    agent.serial = SimpleNamespace(source_addr="com-server:8000")
+    agent._stop = asyncio.Event()
+    offline = []
+    agent._offline_notdruck = offline.append
+    monkeypatch.setattr(main.pairing, "get_device_token", lambda spool: "device-token")
+    payloads = []
+
+    def handle(request):
+        assert request.headers["Authorization"] == "Bearer device-token"
+        # Der Datensatz muss bereits vor Parser und HTTP committed sein.
+        assert len(spool.pending_alarms()) == 1
+        payloads.append(json.loads(request.content))
+        return httpx.Response(status_code if len(payloads) == 1 else 202, json={"duplicate": True})
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: client_class(
+        transport=httpx.MockTransport(handle), **kwargs))
+
+    class Parser:
+        def parse(self, text):
+            assert len(spool.pending_alarms()) == 1
+            return {"info": "local parser"}
+
+    monkeypatch.setattr(main, "get_parser", lambda config: Parser())
+    raw = b"alarm\xff"
+    await agent._on_datagram(raw, "utf-8", True)
+    row = spool.recent_alarms()[0]
+    assert payloads[0] == {
+        "raw_text": "alarm\ufffd", "raw_bytes_b64": base64.b64encode(raw).decode("ascii"),
+        "charset": "utf-8", "sequence": row["sequence"],
+        "received_at": datetime.fromtimestamp(row["received_at"], UTC).isoformat(),
+        "source_addr": "com-server:8000", "incomplete": True,
+        "parsed": {"info": "local parser"}, "parse_status": "parsed",
+    }
+    assert row["forwarded"] == (status_code in (200, 202))
+    if status_code == 500:
+        assert offline == ["alarm\ufffd"]
+        # Config-Aenderung und Neustart duerfen keine Metadaten neu vergeben.
+        agent.serial.source_addr = "changed:9000"
+        path = spool._conn.execute("PRAGMA database_list").fetchone()[2]
+        spool.close()
+        spool = Spool(path)
+        agent.spool = spool
+
+        async def tick(delay):
+            agent._stop.set()
+
+        monkeypatch.setattr(main.asyncio, "sleep", tick)
+        await agent._alarm_forward_loop()
+        try:
+            assert payloads[1] == payloads[0]
+            assert spool.pending_alarms() == []
+        finally:
+            spool.close()
+    else:
+        assert offline == []
+
+
+async def test_heartbeat_contains_latest_serial_receive_time(monkeypatch):
+    import asyncio
+    from datetime import UTC, datetime
+
+    from ecpg.cloud_connector import CloudConnector
+    from ecpg.settings import settings
+
+    last = None
+    connector = CloudConnector("token", {}, serial_last_received_at=lambda: last)
+    messages = []
+    sent = asyncio.Event()
+    monkeypatch.setattr(settings, "heartbeat_s", 0)
+
+    async def send(message):
+        messages.append(message)
+        sent.set()
+        return True
+
+    connector._send = send
+    task = asyncio.create_task(connector._heartbeat_loop())
+    try:
+        await asyncio.wait_for(sent.wait(), 1)
+        assert messages[0] == {"type": "heartbeat", "payload": {"last_received_at": None}}
+        last = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+        sent.clear()
+        await asyncio.wait_for(sent.wait(), 1)
+        assert messages[-1]["payload"]["last_received_at"] == last.isoformat()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.parametrize("strategy", ["idle", "formfeed"])
+async def test_tcp_disconnect_is_spooled_and_delivered_incomplete(spool, monkeypatch, strategy):
+    import asyncio
+    import json
+
+    import httpx
+    from fake_comserver import FakeComServer
+
+    from ecpg import main
+    from ecpg.serial_ingest import SerialIngest
+
+    agent = Agent.__new__(Agent)
+    agent.spool = spool
+    agent.config = {}
+    agent.cloud = None
+    delivered = asyncio.Event()
+    requests = []
+    monkeypatch.setattr(main.pairing, "get_device_token", lambda spool: "token")
+
+    def handle(request):
+        payload = json.loads(request.content)
+        row = spool.pending_alarms()[0]
+        assert row["incomplete"] == 1 and row["sequence"] == payload["sequence"]
+        requests.append(payload)
+        delivered.set()
+        return httpx.Response(202, json={"duplicate": False})
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: client_class(
+        transport=httpx.MockTransport(handle), **kwargs))
+    async with FakeComServer(close_after=1) as server:
+        server.queue(b"alarm interrupted")
+        agent.serial = SerialIngest(agent._on_datagram, agent._on_serial_status)
+        agent.serial.update_config({"host": server.host, "port": server.port,
+                                    "datagram_strategy": strategy})
+        agent.serial.start()
+        try:
+            await asyncio.wait_for(delivered.wait(), 2)
+            assert requests[0]["raw_text"] == "alarm interrupted"
+            assert requests[0]["incomplete"] is True
+            assert requests[0]["source_addr"] == f"{server.host}:{server.port}"
+            assert spool.pending_alarms() == []
+        finally:
+            await agent.serial.stop()

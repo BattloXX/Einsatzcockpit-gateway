@@ -9,6 +9,7 @@ import json
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 RING_MAX = 500
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS kv (
 
 class Spool:
     def __init__(self, db_path: str):
+        self.data_dir = str(Path(db_path).resolve().parent)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -84,6 +86,21 @@ class Spool:
             for name, kind in (("status_failures", "INTEGER DEFAULT 0"), ("status_unknown_since", "REAL")):
                 if name not in columns:
                     self._conn.execute(f"ALTER TABLE spool_jobs ADD COLUMN {name} {kind}")
+            alarm_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(raw_alarms_ring)")}
+            for name, kind in (("sequence", "INTEGER"), ("incomplete", "INTEGER NOT NULL DEFAULT 0"),
+                               ("source_addr", "TEXT")):
+                if name not in alarm_columns:
+                    self._conn.execute(f"ALTER TABLE raw_alarms_ring ADD COLUMN {name} {kind}")
+            # Alte Ring-Eintraege erhalten ebenfalls eine stabile Retry-Sequenz.
+            self._conn.execute("BEGIN IMMEDIATE")
+            counter = self._conn.execute("SELECT v FROM kv WHERE k='alarm_sequence'").fetchone()
+            maximum = self._conn.execute("SELECT MAX(sequence) FROM raw_alarms_ring").fetchone()[0]
+            sequence = max(int(counter[0]) if counter else 0, maximum or 0)
+            for row in self._conn.execute("SELECT id FROM raw_alarms_ring WHERE sequence IS NULL ORDER BY id").fetchall():
+                sequence += 1
+                self._conn.execute("UPDATE raw_alarms_ring SET sequence=? WHERE id=?", (sequence, row[0]))
+            self._conn.execute("INSERT INTO kv(k,v) VALUES('alarm_sequence',?) "
+                               "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(sequence),))
             # Legacy 'printing' ohne CUPS-ID und neue abgebrochene Intents sind unklar.
             self._conn.execute("UPDATE spool_jobs SET status='uncertain', error='restart_during_cups_submit' "
                 "WHERE cups_job IS NULL AND (status='submitting' OR status='printing')")
@@ -236,12 +253,21 @@ class Spool:
             self._conn.commit()
 
     # ── Alarm-Ringpuffer ─────────────────────────────────────────────────────
-    def add_raw_alarm(self, raw_bytes: bytes, charset: str, raw_hash: str) -> int:
-        with self._lock:
+    def add_raw_alarm(self, raw_bytes: bytes, charset: str, raw_hash: str, *,
+                      incomplete: bool = False, source_addr: str | None = None,
+                      received_at: float | None = None) -> int:
+        with self._lock, self._conn:
+            # Zaehler und Insert werden zusammen committed, auch ueber mehrere
+            # Spool-Verbindungen hinweg kann keine Sequenz doppelt vergeben werden.
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("UPDATE kv SET v=CAST(v AS INTEGER)+1 WHERE k='alarm_sequence'")
+            sequence = int(self._conn.execute("SELECT v FROM kv WHERE k='alarm_sequence'").fetchone()[0])
             cur = self._conn.execute(
-                "INSERT INTO raw_alarms_ring (received_at, raw_bytes, charset, raw_hash, forwarded) "
-                "VALUES (?,?,?,?,0)",
-                (time.time(), raw_bytes, charset, raw_hash),
+                "INSERT INTO raw_alarms_ring "
+                "(received_at, raw_bytes, charset, raw_hash, forwarded, sequence, incomplete, source_addr) "
+                "VALUES (?,?,?,?,0,?,?,?)",
+                (time.time() if received_at is None else received_at, raw_bytes, charset, raw_hash,
+                 sequence, int(incomplete), source_addr),
             )
             # Ring begrenzen
             self._conn.execute(
@@ -249,8 +275,12 @@ class Spool:
                 "(SELECT id FROM raw_alarms_ring ORDER BY id DESC LIMIT ?)",
                 (RING_MAX,),
             )
-            self._conn.commit()
             return cur.lastrowid
+
+    def get_raw_alarm(self, alarm_id: int) -> dict:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM raw_alarms_ring WHERE id=?", (alarm_id,)).fetchone()
+            return dict(row)
 
     def mark_alarm_forwarded(self, alarm_id: int) -> None:
         with self._lock:
@@ -267,7 +297,7 @@ class Spool:
     def recent_alarms(self, limit: int = 20) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, received_at, charset, raw_hash, forwarded, raw_bytes "
+                "SELECT * "
                 "FROM raw_alarms_ring ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
