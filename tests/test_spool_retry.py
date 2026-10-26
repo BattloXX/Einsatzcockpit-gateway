@@ -185,7 +185,7 @@ async def test_new_cloud_intent_required_before_local_submit(spool, tmp_path, gr
     spool.update_job("77", pdf_path=str(pdf))
     await mgr.process_due()
     assert len(backend.printed) == int(granted)
-    assert spool.get_job("77")["status"] == ("done" if granted else "uncertain")
+    assert spool.get_job("77")["status"] == ("done" if granted else "failed")
 
 
 def test_duplicate_cannot_remove_required_cloud_intent(spool):

@@ -81,6 +81,11 @@ class CloudConnector:
             finally:
                 hb.cancel()
                 self._ws = None
+                self._connected.clear()
+                for waiter in self._intent_waiters.values():
+                    if not waiter.done():
+                        waiter.set_result(None)
+                self._intent_waiters.clear()
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -99,7 +104,8 @@ class CloudConnector:
         if mtype == "intent_result":
             waiter = self._intent_waiters.get(msg.get("rid"))
             if waiter is not None and not waiter.done():
-                waiter.set_result((msg.get("payload") or {}).get("ok") is True)
+                ok = (msg.get("payload") or {}).get("ok")
+                waiter.set_result(ok if isinstance(ok, bool) else None)
             return
         if mtype == "config_sync":
             self.status_ack_supported = "print-status-ack-v1" in (msg.get("capabilities") or [])
@@ -142,14 +148,19 @@ class CloudConnector:
         return True
 
     # ── Ausgehende Meldungen ─────────────────────────────────────────────────
-    async def request_print_intent(self, job):
+    async def request_print_intent(self, job) -> bool | None:
+        """True: freigegeben, False: explizit verweigert, None: nicht erhalten."""
         rid = uuid4().hex
         waiter = asyncio.get_running_loop().create_future()
         self._intent_waiters[rid] = waiter
         try:
             sent = await self._send({"type": "print_intent", "rid": rid, "payload": {
                 "job_id": int(job["job_id"]), "dispatch_token": job["dispatch_token"], "generation": job["generation"]}})
-            return bool(sent and await asyncio.wait_for(waiter, timeout=10))
+            if not sent:
+                return None
+            return await asyncio.wait_for(waiter, timeout=10)
+        except Exception:
+            return None
         finally:
             self._intent_waiters.pop(rid, None)
 

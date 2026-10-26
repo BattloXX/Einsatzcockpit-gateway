@@ -18,6 +18,7 @@ logger = logging.getLogger("ecpg.print")
 
 MAX_ATTEMPTS = 5
 BACKOFF_BASE_S = 20  # 20, 40, 80, 160, ...
+INTENT_BACKOFF_S = (2, 5, 10, 20)
 MAX_STATUS_FAILURES = 3
 MAX_STATUS_GAP_S = 120
 
@@ -249,11 +250,15 @@ class PrintManager:
             return
         if job.get("requires_intent"):
             try:
-                granted = bool(self.intent_cb and await self.intent_cb(job))
+                granted = await self.intent_cb(job) if self.intent_cb else None
             except Exception:
-                granted = False
-            if not granted:
-                await self._uncertain(job_id, "Keine gueltige Cloud-Druckfreigabe; kein lokaler Druck gestartet")
+                granted = None
+            if granted is False:
+                await self._fail_or_retry(job, "Cloud-Druckfreigabe verweigert; nicht gedruckt", retry=False)
+                return
+            if granted is not True:
+                await self._fail_or_retry(job, "Cloud-Druckfreigabe nicht erhalten; nicht gedruckt",
+                                          retry_delays=INTENT_BACKOFF_S)
                 return
         if not self.spool.begin_submit(job_id):
             return
@@ -345,10 +350,10 @@ class PrintManager:
         if self.spool.update_job(job_id, status="uncertain", error=error):
             await self.status_cb(job_id, "uncertain", error)
 
-    async def _fail_or_retry(self, job: dict, error: str) -> None:
+    async def _fail_or_retry(self, job: dict, error: str, *, retry=True, retry_delays=None) -> None:
         job_id = job["job_id"]
         attempts = (job.get("attempts") or 0) + 1
-        if attempts >= MAX_ATTEMPTS:
+        if not retry or attempts >= MAX_ATTEMPTS:
             if not self.spool.update_job(job_id, allowed_states=("pending", "downloading"),
                                          status="failed", attempts=attempts, error=error, cups_job=None):
                 return
@@ -357,7 +362,8 @@ class PrintManager:
             if self.log_cb:
                 await self.log_cb("error", f"Druckauftrag {job_id} endgültig fehlgeschlagen: {error}")
         else:
-            delay = BACKOFF_BASE_S * (2 ** (attempts - 1))
+            delay = (retry_delays[min(attempts - 1, len(retry_delays) - 1)] if retry_delays
+                     else BACKOFF_BASE_S * (2 ** (attempts - 1)))
             # cups_job zurücksetzen: der Retry soll einen NEUEN CUPS-Job erzeugen,
             # nicht den alten (fehlgeschlagenen) erneut pollen.
             if not self.spool.update_job(job_id, allowed_states=("pending", "downloading"), status="pending", attempts=attempts,

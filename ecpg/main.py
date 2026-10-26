@@ -135,7 +135,7 @@ class Agent:
         task.add_done_callback(self._print_tasks.discard)
 
     async def _print_intent(self, job):
-        return bool(self.cloud and await self.cloud.request_print_intent(job))
+        return await self.cloud.request_print_intent(job) if self.cloud else None
 
     async def _refresh_artifact(self, job_id):
         if self.cloud:

@@ -20,6 +20,15 @@ Auftrag erhält keine neue Freigabe. Eine doppelte Nachricht kann die gespeicher
 Intentpflicht nicht entfernen. Für abgelaufene signierte Artefakt-URLs existiert
 `refresh_artifact`; nur ein lokal noch ungesendeter Job übernimmt die neue URL.
 
+Eine nicht erhaltene Cloud-Freigabe (Timeout, Sendefehler, Verbindungsabbruch oder
+Exception) bleibt vor `begin_submit` retry-faehig, mit `submitted_at IS NULL`.
+Die vorhandenen `attempts`/`next_retry_at` begrenzen die Versuche auf insgesamt
+fuenf, mit Backoff von 2, 5, 10 und maximal 20 Sekunden. Danach wird `failed` mit
+`not_submitted=True` gemeldet; eine explizite Ablehnung (`ok: false`) meldet dies
+sofort. Auch die Outbox rekonstruiert das Flag aus dem gespeicherten Submit-Zustand.
+Verbindungsende loest offene Intent-RPCs sofort als nicht erhalten auf.
+`uncertain` ist erst nach der lokalen CUPS-Grenze moeglich.
+
 Ein Neustart mit lokalem Übergabe-Intent ohne CUPS-ID ergibt `uncertain`. Vorhandene
 CUPS-IDs werden nur gepollt. CUPS-Abbruch, Fehler nach Übergabe und Abbruch eines
 laufenden Jobs gelten als möglicherweise bereits ausgegeben; es gibt keinen
