@@ -174,6 +174,8 @@ class Agent:
         for job in self.spool.unreported_status_jobs():
             if job["status"] in ("pending", "downloading", "submitting"):
                 continue
+            if job["status"] == "printing" and job.get("status_failures"):
+                continue  # Kein erneuter Fortschrittsnachweis waehrend CUPS unklar ist.
             await self._report_job_status(job["job_id"], job["status"], job.get("error"))
 
     async def _spool_loop(self) -> None:

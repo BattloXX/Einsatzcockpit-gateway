@@ -48,3 +48,26 @@ abgleichen und sichern. `submitting`, `printing` und `uncertain` nicht auf `pend
 zurücksetzen. Ein altes Binary enthält wieder die früheren lokalen Retry-Risiken;
 deshalb erst nach Drain beziehungsweise manueller Prüfung zurückwechseln. Die
 SQLite-Datei nicht als vermeintliche Reparatur löschen.
+
+## Nachprüfung: Statusverlust und Abbruch während Download
+
+Fehlgeschlagene oder unverständliche CUPS-Statusabfragen gelten als `unknown`,
+nicht als bestätigtes `printing`. Nach drei erfolglosen Abfragen oder 120 Sekunden
+seit Beginn der Unklarheit wird `uncertain` gespeichert. `status_failures` und
+`status_unknown_since` werden additiv in SQLite ergänzt und überleben Neustarts.
+Während der Abklärung werden weder neue Fortschrittsmeldungen noch unbestätigte
+`printing`-Outboxmeldungen gesendet. Ein vorübergehender Fehler kann sich anhand
+des bestehenden CUPS-Jobs auflösen; es erfolgt keine zweite CUPS-Übergabe.
+
+Download-, Render-, Retry- und Poll-Rückläufe ändern Zustände nur noch atomar aus
+erlaubten Ausgangszuständen. Terminale Zustände bleiben erhalten. Der Abbruch
+entscheidet innerhalb einer SQLite-Operation anhand des aktuellen Submit-Intents
+beziehungsweise CUPS-Jobs zwischen `canceled` und `uncertain`. Ein während des
+Downloads abgebrochener Job wird deshalb auch im Legacy-Protokoll nicht gedruckt.
+Fehlerhafte verspätete Downloads können ihn ebenfalls nicht erneut einreihen.
+Fehlermeldungen enthalten keine Download-URLs oder fremden Exception-Nutzdaten.
+
+Die erweiterte Suite besteht mit **55 Tests**. Neue Regressionen decken Legacy/v2,
+erfolgreiche und fehlerhafte verspätete Downloads, restartfeste CUPS-Abklärung,
+unterdrückte Fortschritts-Replays und erfolgreiche Statuswiederkehr ab. Die
+physische Geräteabnahme ist damit weiterhin nicht ersetzt.
