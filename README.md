@@ -100,7 +100,7 @@ Gateway-Verwaltung) und als Image-Tag vergeben – neben `latest` auch die Versi
 für lokale Installationen.
 
 Für einen **reproduzierbaren Betrieb** eine feste Version im `docker-compose.yml`
-pinnen statt `:latest`, z. B. `image: ghcr.io/battloxx/einsatzcockpit-gateway:2026.10.26`.
+pinnen statt `:latest`, z. B. `image: ghcr.io/battloxx/einsatzcockpit-gateway:2026.10.27`.
 Ein Release entsteht mit `gh release create vJJJJ.MM.TT --target main`.
 
 ## Entwicklung / Tests
